@@ -1,7 +1,9 @@
 from datetime import date
 from django import forms
 from django.contrib.auth.models import User
-from .models import Faculty, Qualification, Subject, SubjectAllocation, LeaveRequest, PerformanceEvaluation
+from django.contrib.auth.password_validation import validate_password
+from django.db.models import Q
+from .models import Department, UserProfile, Faculty, Qualification, Subject, SubjectAllocation, LeaveRequest, PerformanceEvaluation
 
 
 class BootstrapModelForm(forms.ModelForm):
@@ -123,9 +125,53 @@ class PerformanceForm(BootstrapModelForm):
 
 
 class UserCreateForm(forms.ModelForm):
-    password = forms.CharField(widget=forms.PasswordInput)
-    role = forms.ChoiceField(choices=[('ADMIN', 'Administrator'), ('HOD', 'HOD'), ('FACULTY', 'Faculty')])
+    """Create / edit a login together with its role and RBAC scope."""
+    password = forms.CharField(widget=forms.PasswordInput, required=False)
+    role = forms.ChoiceField(choices=UserProfile.ROLE_CHOICES)
+    department = forms.ModelChoiceField(
+        queryset=Department.objects.filter(status=True), required=False,
+        help_text='Required for HOD. The HOD can access only this department.')
+    faculty = forms.ModelChoiceField(
+        queryset=Faculty.objects.none(), required=False, label='Faculty record',
+        help_text='Required for Faculty. The login will see only this record\'s data.')
 
     class Meta:
         model = User
-        fields = ['username', 'first_name', 'last_name', 'email', 'password', 'role']
+        # password/role/department/faculty are handled explicitly in the view,
+        # so they must not be written onto the User instance by the form.
+        fields = ['username', 'first_name', 'last_name', 'email']
+
+    field_order = ['username', 'first_name', 'last_name', 'email', 'password', 'role', 'department', 'faculty']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for name, field in self.fields.items():
+            field.widget.attrs['class'] = 'form-select' if isinstance(field, forms.ModelChoiceField) or name == 'role' else 'form-control'
+        # Only faculty records that are not yet linked to another login (plus this user's own).
+        linked = Q(user__isnull=True)
+        if self.instance.pk:
+            linked |= Q(user=self.instance)
+            profile = getattr(self.instance, 'userprofile', None)
+            own = Faculty.objects.filter(user=self.instance).first()
+            self.fields['role'].initial = profile.role if profile else 'FACULTY'
+            self.fields['department'].initial = profile.department if profile else None
+            self.fields['faculty'].initial = own
+            self.fields['password'].help_text = 'Leave blank to keep the current password.'
+        else:
+            self.fields['password'].required = True
+        self.fields['faculty'].queryset = Faculty.objects.filter(linked).order_by('name')
+
+    def clean_password(self):
+        password = self.cleaned_data.get('password')
+        if password:
+            validate_password(password, self.instance if self.instance.pk else None)
+        return password
+
+    def clean(self):
+        cleaned = super().clean()
+        role = cleaned.get('role')
+        if role == 'HOD' and not cleaned.get('department'):
+            self.add_error('department', 'Select the department this HOD manages.')
+        if role == 'FACULTY' and not cleaned.get('faculty'):
+            self.add_error('faculty', 'Link this login to a faculty record.')
+        return cleaned

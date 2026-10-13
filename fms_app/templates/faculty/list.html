@@ -192,7 +192,7 @@
                             </a>
 
 
-                            {% if request.user.is_superuser or request.user.userprofile.role == 'ADMIN' %}
+                            {% if is_admin %}
 
                                 <form
                                     method="post"

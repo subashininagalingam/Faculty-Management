@@ -7,9 +7,32 @@ from django.core.paginator import Paginator
 from django.db.models import Q, Sum, Count, Avg
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
-from .decorators import get_role, role_required
+from django.db import transaction
+from django.http import FileResponse, Http404
+from .decorators import (ADMIN, HOD, FACULTY, get_role, get_department, can_access_faculty,
+                         role_required, scope_queryset, scoped_faculty)
 from .forms import FacultyForm, QualificationForm, SubjectForm, AllocationForm, LeaveForm, PerformanceForm, UserCreateForm
 from .models import Department, Faculty, Qualification, Subject, SubjectAllocation, Workload, LeaveRequest, PerformanceEvaluation, UserProfile
+
+
+# --------------------------------------------------------------------------
+# RBAC helpers
+# --------------------------------------------------------------------------
+def _denied(request):
+    messages.error(request, 'You do not have permission to access that record.')
+    return redirect('dashboard')
+
+
+def visible_departments(user):
+    """Departments the user may pick / filter by."""
+    qs = Department.objects.filter(status=True)
+    role = get_role(user)
+    if role == ADMIN:
+        return qs
+    if role == HOD:
+        dept = get_department(user)
+        return qs.filter(pk=dept.pk) if dept else qs.none()
+    return qs.none()
 
 
 def login_page(request):
@@ -18,25 +41,33 @@ def login_page(request):
 
 @login_required
 def dashboard(request):
-    role = get_role(request.user)
-    faculties = Faculty.objects.all()
-    if role == 'HOD':
-        profile = getattr(request.user, 'userprofile', None)
-        if profile and profile.department:
-            faculties = faculties.filter(department=profile.department)
-    if role == 'FACULTY':
-        faculties = faculties.filter(user=request.user)
+    user = request.user
+    role = get_role(user)
+    faculties = scoped_faculty(user)
+    allocations = scope_queryset(SubjectAllocation.objects.all(), user, 'department', 'faculty')
+    leaves = scope_queryset(LeaveRequest.objects.all(), user, 'faculty__department', 'faculty')
+    evaluations = scope_queryset(PerformanceEvaluation.objects.select_related('faculty'), user, 'faculty__department', 'faculty')
+    active_allocations = allocations.filter(status='Active')
+    if role == ADMIN:
+        subjects = Subject.objects.filter(status='Active')
+    elif role == HOD:
+        subjects = scope_queryset(Subject.objects.filter(status='Active'), user, 'department')
+    else:
+        subjects = Subject.objects.filter(status='Active', allocations__in=active_allocations).distinct()
+    high_workload = (faculties.select_related('department')
+                     .annotate(total_hours=Sum('allocations__hours_per_week', filter=Q(allocations__status='Active')))
+                     .filter(total_hours__gt=20).order_by('-total_hours')[:5])
     context = {
-        'role': role,
-        'own_faculty': Faculty.objects.filter(user=request.user).first(),
+        'own_faculty': Faculty.objects.filter(user=user).first(),
         'total_faculty': faculties.count(),
         'active_faculty': faculties.filter(status='Active').count(),
-        'departments': Department.objects.filter(status=True).count(),
-        'subjects': Subject.objects.filter(status='Active').count(),
-        'pending_leaves': LeaveRequest.objects.filter(status='Pending').count() if role != 'FACULTY' else LeaveRequest.objects.filter(faculty__user=request.user, status='Pending').count(),
-        'allocations': SubjectAllocation.objects.filter(status='Active').count(),
-        'high_workload': [f for f in faculties if f.allocations.filter(status='Active').aggregate(total=Sum('hours_per_week'))['total'] and f.allocations.filter(status='Active').aggregate(total=Sum('hours_per_week'))['total'] > 20][:5],
-        'recent_evaluations': PerformanceEvaluation.objects.select_related('faculty').order_by('-evaluation_date')[:5],
+        'departments': visible_departments(user).count(),
+        'subjects': subjects.count(),
+        'pending_leaves': leaves.filter(status='Pending').count(),
+        'allocations': active_allocations.count(),
+        'weekly_hours': active_allocations.aggregate(total=Sum('hours_per_week'))['total'] or 0,
+        'high_workload': high_workload,
+        'recent_evaluations': evaluations.order_by('-evaluation_date')[:5],
     }
     return render(request, 'dashboard/dashboard.html', context)
 
@@ -49,10 +80,7 @@ def faculty_list(request):
     department = request.GET.get('department', '')
     designation = request.GET.get('designation', '')
     status = request.GET.get('status', '')
-    if get_role(request.user) == 'HOD':
-        profile = getattr(request.user, 'userprofile', None)
-        if profile and profile.department:
-            qs = qs.filter(department=profile.department)
+    qs = qs.filter(pk__in=scoped_faculty(request.user).values('pk'))
     if q:
         qs = qs.filter(Q(name__icontains=q) | Q(faculty_id__icontains=q) | Q(email__icontains=q))
     if department:
@@ -63,13 +91,14 @@ def faculty_list(request):
         qs = qs.filter(status=status)
     paginator = Paginator(qs, 8)
     page = paginator.get_page(request.GET.get('page'))
-    return render(request, 'faculty/list.html', {'page': page, 'departments': Department.objects.filter(status=True), 'q': q, 'designation': designation, 'status': status})
+    return render(request, 'faculty/list.html', {'page': page, 'departments': visible_departments(request.user), 'q': q, 'designation': designation, 'status': status})
 
 
 @login_required
 @role_required('ADMIN', 'HOD')
 def faculty_add(request):
     form = FacultyForm(request.POST or None, request.FILES or None)
+    form.fields['department'].queryset = visible_departments(request.user)
     if request.method == 'POST' and form.is_valid():
         faculty = form.save()
         messages.success(request, 'Faculty profile added successfully.')
@@ -80,11 +109,11 @@ def faculty_add(request):
 @login_required
 @role_required('ADMIN', 'HOD')
 def faculty_edit(request, pk):
-    faculty = get_object_or_404(Faculty, pk=pk)
-    if get_role(request.user) == 'HOD' and faculty.department != getattr(request.user.userprofile, 'department', None):
-        messages.error(request, 'You can edit only your department faculty.')
-        return redirect('faculty_list')
+    faculty = scoped_faculty(request.user).filter(pk=pk).first()
+    if faculty is None:
+        return _denied(request)
     form = FacultyForm(request.POST or None, request.FILES or None, instance=faculty)
+    form.fields['department'].queryset = visible_departments(request.user)
     if request.method == 'POST' and form.is_valid():
         form.save()
         messages.success(request, 'Faculty profile updated.')
@@ -94,11 +123,20 @@ def faculty_edit(request, pk):
 
 @login_required
 def faculty_detail(request, pk):
-    faculty = get_object_or_404(Faculty.objects.select_related('department'), pk=pk)
-    if get_role(request.user) == 'FACULTY' and faculty.user != request.user:
-        messages.error(request, 'You can view only your profile.')
-        return redirect('dashboard')
+    faculty = scoped_faculty(request.user).select_related('department').filter(pk=pk).first()
+    if faculty is None:
+        return _denied(request)
     return render(request, 'faculty/detail.html', {'faculty': faculty, 'qualifications': faculty.qualifications.all(), 'allocations': faculty.allocations.select_related('subject'), 'leaves': faculty.leaves.order_by('-applied_date')[:5], 'evaluations': faculty.evaluations.order_by('-evaluation_date')[:5]})
+
+
+@login_required
+def faculty_own(request):
+    """'My Profile' shortcut for the logged-in faculty member."""
+    own = Faculty.objects.filter(user=request.user).first()
+    if own is None:
+        messages.error(request, 'Your login is not linked to a faculty record. Please contact the administrator.')
+        return redirect('dashboard')
+    return redirect('faculty_detail', own.pk)
 
 
 @login_required
@@ -111,13 +149,13 @@ def faculty_delete(request, pk):
     return redirect('faculty_list')
 
 
+def _qualifications(user):
+    return scope_queryset(Qualification.objects.select_related('faculty'), user, 'faculty__department', 'faculty')
+
+
 @login_required
 def qualification_list(request):
-    qs = Qualification.objects.select_related('faculty').order_by('-year')
-    if get_role(request.user) == 'FACULTY':
-        qs = qs.filter(faculty__user=request.user)
-    elif get_role(request.user) == 'HOD':
-        qs = qs.filter(faculty__department=getattr(request.user.userprofile, 'department', None))
+    qs = _qualifications(request.user).order_by('-year')
     return render(request, 'qualification/list.html', {'qualifications': qs})
 
 
@@ -125,8 +163,9 @@ def qualification_list(request):
 @role_required('ADMIN', 'HOD')
 def qualification_add(request):
     form = QualificationForm(request.POST or None, request.FILES or None)
+    form.fields['faculty'].queryset = scoped_faculty(request.user).order_by('name')
     if request.method == 'POST' and form.is_valid():
-        obj = form.save()
+        form.save()
         messages.success(request, 'Qualification saved successfully.')
         return redirect('qualification_list')
     return render(request, 'qualification/form.html', {'form': form, 'title': 'Add Qualification'})
@@ -135,8 +174,11 @@ def qualification_add(request):
 @login_required
 @role_required('ADMIN', 'HOD')
 def qualification_edit(request, pk):
-    obj = get_object_or_404(Qualification, pk=pk)
+    obj = _qualifications(request.user).filter(pk=pk).first()
+    if obj is None:
+        return _denied(request)
     form = QualificationForm(request.POST or None, request.FILES or None, instance=obj)
+    form.fields['faculty'].queryset = scoped_faculty(request.user).order_by('name')
     if request.method == 'POST' and form.is_valid():
         form.save(); messages.success(request, 'Qualification updated.'); return redirect('qualification_list')
     return render(request, 'qualification/form.html', {'form': form, 'title': 'Edit Qualification'})
@@ -145,26 +187,33 @@ def qualification_edit(request, pk):
 @login_required
 @role_required('ADMIN', 'HOD')
 def qualification_delete(request, pk):
-    obj = get_object_or_404(Qualification, pk=pk)
+    obj = _qualifications(request.user).filter(pk=pk).first()
+    if obj is None:
+        return _denied(request)
     if request.method == 'POST': obj.delete(); messages.success(request, 'Qualification deleted.')
     return redirect('qualification_list')
+
+
+def _subjects(user):
+    return scope_queryset(Subject.objects.select_related('department'), user, 'department')
 
 
 @login_required
 @role_required('ADMIN', 'HOD')
 def subject_list(request):
-    qs = Subject.objects.select_related('department').order_by('subject_code')
+    qs = _subjects(request.user).order_by('subject_code')
     q = request.GET.get('q', '')
     department = request.GET.get('department', '')
     if q: qs = qs.filter(Q(subject_code__icontains=q) | Q(subject_name__icontains=q))
     if department: qs = qs.filter(department_id=department)
-    return render(request, 'subject/list.html', {'subjects': qs, 'departments': Department.objects.filter(status=True), 'q': q, 'selected_department': department})
+    return render(request, 'subject/list.html', {'subjects': qs, 'departments': visible_departments(request.user), 'q': q, 'selected_department': department})
 
 
 @login_required
 @role_required('ADMIN', 'HOD')
 def subject_add(request):
     form = SubjectForm(request.POST or None)
+    form.fields['department'].queryset = visible_departments(request.user)
     if request.method == 'POST' and form.is_valid(): form.save(); messages.success(request, 'Subject added.'); return redirect('subject_list')
     return render(request, 'subject/form.html', {'form': form, 'title': 'Add Subject'})
 
@@ -172,7 +221,11 @@ def subject_add(request):
 @login_required
 @role_required('ADMIN', 'HOD')
 def subject_edit(request, pk):
-    obj = get_object_or_404(Subject, pk=pk); form = SubjectForm(request.POST or None, instance=obj)
+    obj = _subjects(request.user).filter(pk=pk).first()
+    if obj is None:
+        return _denied(request)
+    form = SubjectForm(request.POST or None, instance=obj)
+    form.fields['department'].queryset = visible_departments(request.user)
     if request.method == 'POST' and form.is_valid(): form.save(); messages.success(request, 'Subject updated.'); return redirect('subject_list')
     return render(request, 'subject/form.html', {'form': form, 'title': 'Edit Subject'})
 
@@ -185,26 +238,30 @@ def subject_delete(request, pk):
     return redirect('subject_list')
 
 
+def _allocations(user):
+    return scope_queryset(SubjectAllocation.objects.select_related('faculty', 'subject', 'department'), user, 'department', 'faculty')
+
+
 @login_required
 @role_required('ADMIN', 'HOD', 'FACULTY')
 def allocation_list(request):
-    qs = SubjectAllocation.objects.select_related('faculty', 'subject', 'department').order_by('-allocation_date')
-    if get_role(request.user) == 'HOD': qs = qs.filter(department=getattr(request.user.userprofile, 'department', None))
-    if get_role(request.user) == 'FACULTY': qs = qs.filter(faculty__user=request.user)
+    qs = _allocations(request.user).order_by('-allocation_date')
     department = request.GET.get('department', '')
     semester = request.GET.get('semester', '')
     year = request.GET.get('academic_year', '')
     if department: qs = qs.filter(department_id=department)
     if semester: qs = qs.filter(semester=semester)
     if year: qs = qs.filter(academic_year=year)
-    return render(request, 'allocation/list.html', {'allocations': qs, 'departments': Department.objects.filter(status=True), 'selected_department': department, 'selected_semester': semester, 'selected_year': year})
+    return render(request, 'allocation/list.html', {'allocations': qs, 'departments': visible_departments(request.user), 'selected_department': department, 'selected_semester': semester, 'selected_year': year})
 
 
 @login_required
 @role_required('ADMIN', 'HOD')
 def allocation_add(request):
     form = AllocationForm(request.POST or None)
-    if get_role(request.user) == 'HOD': form.fields['department'].queryset = Department.objects.filter(pk=getattr(request.user.userprofile, 'department_id', None))
+    form.fields['department'].queryset = visible_departments(request.user)
+    form.fields['faculty'].queryset = scoped_faculty(request.user).order_by('name')
+    form.fields['subject'].queryset = _subjects(request.user).filter(status='Active')
     if request.method == 'POST' and form.is_valid():
         obj = form.save()
         Workload.objects.update_or_create(faculty=obj.faculty, subject=obj.subject, academic_year=obj.academic_year, semester=obj.semester, defaults={'hours_per_week': obj.hours_per_week})
@@ -216,7 +273,9 @@ def allocation_add(request):
 @login_required
 @role_required('ADMIN', 'HOD')
 def allocation_delete(request, pk):
-    obj = get_object_or_404(SubjectAllocation, pk=pk)
+    obj = _allocations(request.user).filter(pk=pk).first()
+    if obj is None:
+        return _denied(request)
     if request.method == 'POST':
         Workload.objects.filter(faculty=obj.faculty, subject=obj.subject, academic_year=obj.academic_year, semester=obj.semester).delete()
         obj.delete(); messages.success(request, 'Allocation removed and workload recalculated.')
@@ -226,38 +285,40 @@ def allocation_delete(request, pk):
 @login_required
 @role_required('ADMIN', 'HOD', 'FACULTY')
 def workload(request):
-    faculties = Faculty.objects.select_related('department').all()
-    if get_role(request.user) == 'HOD': faculties = faculties.filter(department=getattr(request.user.userprofile, 'department', None))
-    if get_role(request.user) == 'FACULTY': faculties = faculties.filter(user=request.user)
+    faculties = scoped_faculty(request.user).select_related('department').order_by('name')
     rows = []
     for faculty in faculties:
-        total = faculty.allocations.filter(status='Active').aggregate(total=Sum('hours_per_week'))['total'] or 0
-        rows.append({'faculty': faculty, 'total': total, 'items': faculty.allocations.filter(status='Active').select_related('subject')})
+        items = faculty.allocations.filter(status='Active').select_related('subject')
+        total = items.aggregate(total=Sum('hours_per_week'))['total'] or 0
+        rows.append({'faculty': faculty, 'total': total, 'items': items})
     return render(request, 'workload/dashboard.html', {'rows': rows})
+
+
+def _leaves(user):
+    return scope_queryset(LeaveRequest.objects.select_related('faculty', 'approved_by'), user, 'faculty__department', 'faculty')
 
 
 @login_required
 @role_required('ADMIN', 'HOD', 'FACULTY')
 def leave_list(request):
-    qs = LeaveRequest.objects.select_related('faculty', 'approved_by').order_by('-applied_date')
-    if get_role(request.user) == 'HOD': qs = qs.filter(faculty__department=getattr(request.user.userprofile, 'department', None))
-    if get_role(request.user) == 'FACULTY': qs = qs.filter(faculty__user=request.user)
+    qs = _leaves(request.user).order_by('-applied_date')
     status = request.GET.get('status', '')
     if status: qs = qs.filter(status=status)
-    return render(request, 'leave/list.html', {'leaves': qs, 'status': status, 'role': get_role(request.user)})
+    return render(request, 'leave/list.html', {'leaves': qs, 'status': status})
 
 
 @login_required
-@role_required('ADMIN', 'HOD', 'FACULTY')
+@role_required('HOD', 'FACULTY')
 def leave_add(request):
+    # Faculty: only themselves. HOD: own department. Admin: everyone.
+    allowed = scoped_faculty(request.user).order_by('name')
+    if get_role(request.user) == FACULTY and not allowed.exists():
+        messages.error(request, 'Your login is not linked to a faculty record. Please contact the administrator.')
+        return redirect('leave_list')
     form = LeaveForm(request.POST or None)
-    role = get_role(request.user)
-    if role == 'FACULTY':
-        form.fields['faculty'].queryset = Faculty.objects.filter(user=request.user)
-        faculty = Faculty.objects.filter(user=request.user).first()
-        if faculty: form.fields['faculty'].initial = faculty
-    elif role == 'HOD':
-        form.fields['faculty'].queryset = Faculty.objects.filter(department=getattr(request.user.userprofile, 'department', None))
+    form.fields['faculty'].queryset = allowed
+    if get_role(request.user) == FACULTY:
+        form.fields['faculty'].initial = allowed.first()
     if request.method == 'POST' and form.is_valid(): form.save(); messages.success(request, 'Leave request submitted.'); return redirect('leave_list')
     return render(request, 'leave/form.html', {'form': form})
 
@@ -265,7 +326,12 @@ def leave_add(request):
 @login_required
 @role_required('ADMIN', 'HOD')
 def leave_action(request, pk, action):
-    leave = get_object_or_404(LeaveRequest, pk=pk)
+    leave = _leaves(request.user).filter(pk=pk).first()
+    if leave is None or action not in ('approve', 'reject'):
+        return _denied(request)
+    if get_role(request.user) == HOD and leave.faculty.user_id == request.user.id:
+        messages.error(request, 'You cannot approve or reject your own leave request. Please ask the administrator.')
+        return redirect('leave_list')
     if request.method == 'POST' and leave.status == 'Pending':
         if action == 'approve': leave.status = 'Approved'; message = 'Leave approved.'
         else: leave.status = 'Rejected'; message = 'Leave rejected.'
@@ -274,12 +340,14 @@ def leave_action(request, pk, action):
     return redirect('leave_list')
 
 
+def _evaluations(user):
+    return scope_queryset(PerformanceEvaluation.objects.select_related('faculty', 'evaluator'), user, 'faculty__department', 'faculty')
+
+
 @login_required
 @role_required('ADMIN', 'HOD', 'FACULTY')
 def performance_list(request):
-    qs = PerformanceEvaluation.objects.select_related('faculty', 'evaluator').order_by('-evaluation_date')
-    if get_role(request.user) == 'HOD': qs = qs.filter(faculty__department=getattr(request.user.userprofile, 'department', None))
-    if get_role(request.user) == 'FACULTY': qs = qs.filter(faculty__user=request.user)
+    qs = _evaluations(request.user).order_by('-evaluation_date')
     return render(request, 'performance/list.html', {'evaluations': qs})
 
 
@@ -287,7 +355,7 @@ def performance_list(request):
 @role_required('ADMIN', 'HOD')
 def performance_add(request):
     form = PerformanceForm(request.POST or None)
-    if get_role(request.user) == 'HOD': form.fields['faculty'].queryset = Faculty.objects.filter(department=getattr(request.user.userprofile, 'department', None))
+    form.fields['faculty'].queryset = scoped_faculty(request.user).order_by('name')
     if request.method == 'POST' and form.is_valid():
         obj = form.save(commit=False); obj.evaluator = request.user; obj.save(); messages.success(request, f'Evaluation saved. Score: {obj.total_score}/100 ({obj.rating}).'); return redirect('performance_list')
     return render(request, 'performance/form.html', {'form': form})
@@ -296,9 +364,42 @@ def performance_add(request):
 @login_required
 @role_required('ADMIN', 'HOD')
 def performance_delete(request, pk):
-    obj = get_object_or_404(PerformanceEvaluation, pk=pk)
+    obj = _evaluations(request.user).filter(pk=pk).first()
+    if obj is None:
+        return _denied(request)
     if request.method == 'POST': obj.delete(); messages.success(request, 'Evaluation deleted.')
     return redirect('performance_list')
+
+
+# --------------------------------------------------------------------------
+# User management (Admin only)
+# --------------------------------------------------------------------------
+def _save_user(form, user=None):
+    """Persist user + role/department + faculty link atomically."""
+    with transaction.atomic():
+        new = form.save(commit=False)
+        password = form.cleaned_data.get('password')
+        if password:
+            new.set_password(password)
+        new.save()
+        role = form.cleaned_data['role']
+        dept = form.cleaned_data['department'] if role == HOD else None
+        UserProfile.objects.update_or_create(user=new, defaults={'role': role, 'department': dept})
+        Faculty.objects.filter(user=new).update(user=None)
+        faculty = form.cleaned_data.get('faculty')
+        if faculty:
+            faculty.user = new
+            faculty.save(update_fields=['user'])
+    return new
+
+
+@login_required
+@role_required('ADMIN')
+def user_list(request):
+    users = User.objects.select_related('userprofile__department').order_by('username')
+    linked = {f.user_id: f for f in Faculty.objects.filter(user__isnull=False)}
+    rows = [{'user': u, 'role': get_role(u), 'department': getattr(getattr(u, 'userprofile', None), 'department', None), 'faculty': linked.get(u.id)} for u in users]
+    return render(request, 'dashboard/user_list.html', {'rows': rows})
 
 
 @login_required
@@ -306,18 +407,51 @@ def performance_delete(request, pk):
 def user_add(request):
     form = UserCreateForm(request.POST or None)
     if request.method == 'POST' and form.is_valid():
-        user = form.save(commit=False); role = form.cleaned_data['role']; user.set_password(form.cleaned_data['password']); user.save()
-        UserProfile.objects.create(user=user, role=role)
+        _save_user(form)
         messages.success(request, 'User account created.')
-        return redirect('dashboard')
-    return render(request, 'dashboard/user_form.html', {'form': form})
+        return redirect('user_list')
+    return render(request, 'dashboard/user_form.html', {'form': form, 'title': 'Create User Account', 'button': 'Create User'})
+
+
+@login_required
+@role_required('ADMIN')
+def user_edit(request, pk):
+    target = get_object_or_404(User, pk=pk)
+    form = UserCreateForm(request.POST or None, instance=target)
+    if request.method == 'POST' and form.is_valid():
+        if target.pk == request.user.pk and form.cleaned_data['role'] != ADMIN and not target.is_superuser:
+            form.add_error('role', 'You cannot remove your own administrator role.')
+        else:
+            _save_user(form)
+            messages.success(request, 'User account updated.')
+            return redirect('user_list')
+    return render(request, 'dashboard/user_form.html', {'form': form, 'title': f'Edit User: {target.username}', 'button': 'Save Changes'})
+
+
+@login_required
+def protected_media(request, path):
+    """Serve uploaded files only to users allowed to see the owning record."""
+    from django.conf import settings
+    import posixpath
+    clean = posixpath.normpath(path).lstrip('/')
+    if clean.startswith('..'):
+        raise Http404
+    faculty = Faculty.objects.filter(profile_photo=clean).first()
+    qual = None if faculty else Qualification.objects.select_related('faculty').filter(certificate=clean).first()
+    owner = faculty or (qual.faculty if qual else None)
+    if owner is None or not can_access_faculty(request.user, owner):
+        raise Http404
+    full = (settings.MEDIA_ROOT / clean)
+    if not full.is_file():
+        raise Http404
+    return FileResponse(open(full, 'rb'))
 
 
 @login_required
 @role_required('ADMIN')
 def reports(request):
     return render(request, 'reports/index.html', {
-        'department_rows': Department.objects.annotate(faculty_count=Count('faculty'), subject_count=Count('subject')),
+        'department_rows': Department.objects.annotate(faculty_count=Count('faculty', distinct=True), subject_count=Count('subject', distinct=True)),
         'allocation_count': SubjectAllocation.objects.count(),
         'leave_count': LeaveRequest.objects.count(),
         'evaluation_count': PerformanceEvaluation.objects.count(),

@@ -10,9 +10,5 @@ urlpatterns = [
     path('', include('fms_app.urls')),
 ]
 
-
-if settings.DEBUG:
-    urlpatterns += static(
-        settings.MEDIA_URL,
-        document_root=settings.MEDIA_ROOT
-    )
+# Uploaded media is served by fms_app.views.protected_media (login + RBAC checked),
+# never as a public static directory.

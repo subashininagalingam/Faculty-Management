@@ -181,7 +181,7 @@
 
 
                             <!-- Only admin can delete -->
-                            {% if request.user.userprofile.role == 'ADMIN' %}
+                            {% if is_admin %}
 
                                 <form
                                     class="d-inline delete-form"

@@ -37,7 +37,7 @@
 
 
     <!-- Faculty users cannot create evaluations -->
-    {% if request.user.userprofile.role != 'FACULTY' %}
+    {% if is_manager %}
 
         <a href="{% url 'performance_add' %}"
            class="btn btn-primary">
@@ -121,7 +121,7 @@
 
 
                     <!-- Delete button for non-faculty users -->
-                    {% if request.user.userprofile.role != 'FACULTY' %}
+                    {% if is_manager %}
 
                         <form method="post"
                               action="{% url 'performance_delete' e.pk %}"

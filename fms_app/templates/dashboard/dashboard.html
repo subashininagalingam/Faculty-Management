@@ -18,12 +18,28 @@
 <div class="dashboard-header d-flex flex-wrap justify-content-between align-items-center mb-4">
 
     <div>
-        <div class="dashboard-title">Welcome back,{{ request.user.first_name|default:request.user.username }}</div>
+        <div class="dashboard-title">Welcome back, {{ request.user.first_name|default:request.user.username }}</div>
         <p class="text-muted mb-0">
-             Monitor faculty, workload, leave and performance from one place.
+            {% if is_admin %}Monitor faculty, workload, leave and performance across all departments.
+            {% elif is_hod %}Monitor faculty, workload, leave and performance for {% if user_department %}the {{ user_department.name }} department{% else %}your department{% endif %}.
+            {% else %}Your subjects, workload, leave and performance at a glance.{% endif %}
         </p>
     </div>
 </div>
+
+{% if is_hod and not user_department %}
+<div class="alert alert-warning">
+    <i class="bi bi-exclamation-triangle"></i>
+    No department is assigned to your account yet, so no data can be shown. Please contact the administrator.
+</div>
+{% endif %}
+
+{% if is_faculty and not own_faculty %}
+<div class="alert alert-warning">
+    <i class="bi bi-exclamation-triangle"></i>
+    Your login is not linked to a faculty record yet, so no data can be shown. Please contact the administrator.
+</div>
+{% endif %}
 
 {% if role == 'FACULTY' and own_faculty %}
 
@@ -41,6 +57,7 @@
 
 <div class="dashboard-stats row g-3 mb-4">
 
+    {% if is_manager %}
     <div class="col-6 col-xl-2">
         <div class="stat-box">
             <div class="stat-icon">
@@ -76,6 +93,17 @@
             <h3>{{ departments }}</h3>
         </div>
     </div>
+    {% else %}
+    <div class="col-6 col-xl-2">
+        <div class="stat-box">
+            <div class="stat-icon">
+                <i class="bi bi-clock-history"></i>
+            </div>
+            <small>Hours / Week</small>
+            <h3>{{ weekly_hours }}</h3>
+        </div>
+    </div>
+    {% endif %}
 
     <div class="col-6 col-xl-2">
         <div class="stat-box">
@@ -83,7 +111,7 @@
                 <i class="bi bi-book"></i>
             </div>
 
-            <small>Subjects</small>
+            <small>{% if is_faculty %}My Subjects{% else %}Subjects{% endif %}</small>
             <h3>{{ subjects }}</h3>
         </div>
     </div>
@@ -101,7 +129,7 @@
     </div>
 
     <div class="col-6 col-xl-2">
-        <div class="stat-bax">
+        <div class="stat-box">
             <div class="stat-icon">
                 <i class="bi bi-diagram-3"></i>
             </div>
@@ -116,7 +144,7 @@
 
 <div class="dashboard-content row g-4">
 
-    <!-- recent evalutions -->
+    <!-- recent evaluations -->
 
     <div class="col-lg-7">
 
@@ -124,9 +152,9 @@
 
             <div class="card-header bg-white d-flex justify-content-between">
 
-                <strong>Recent Evalutions</strong>
+                <strong>Recent Evaluations</strong>
                 <a href="{% url 'performance_list' %}"
-                    class="small"></a>
+                    class="small">View all</a>
             </div>
 
             <div class="table-responsive">
@@ -194,10 +222,10 @@
     <div class="col-lg-5">
 
         <div class="workload-card card h-100">
-            <div class="card-headef bg-white">
+            <div class="card-header bg-white">
 
                 <strong>
-                    High Workload Faculty
+                    {% if is_faculty %}My Workload{% else %}High Workload Faculty{% endif %}
                 </strong>
             </div>
 
@@ -225,7 +253,7 @@
 
                   {% empty %}
                    <p class="text-muted mb-0">
-                    No faculty above 20 hours/week.
+                    {% if is_faculty %}Your workload is within 20 hours/week.{% else %}No faculty above 20 hours/week.{% endif %}
                 </p>
 
                 {% endfor %}

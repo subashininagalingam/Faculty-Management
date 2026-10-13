@@ -6,7 +6,7 @@
 {% endblock %}
 
 {% block page_heading %}
-    Add System User
+    User Management
 {% endblock %}
 
 {% block extra_css %}
@@ -18,12 +18,13 @@
 <div class="user-form-page">
 
     <div class="user-form-title">
-        Create User Account
+        {{ title|default:'Create User Account' }}
     </div>
 
     <p class="text-muted mb-4">
-        Create a login and assign one of the FDS roles:
-        Administrator, HOD or Faculty.
+        Assign a role and its access scope. <strong>Administrator</strong> has full access,
+        <strong>HOD</strong> sees only the selected department, and <strong>Faculty</strong>
+        sees only the linked faculty record's data.
     </p>
 
 
@@ -35,13 +36,17 @@
 
             {% for field in form %}
 
-                <div class="user-field col-md-6">
+                <div class="user-field col-md-6" data-field="{{ field.name }}">
 
                     <label class="form-label">
                         {{ field.label }}
                     </label>
 
                     {{ field }}
+
+                    {% if field.help_text %}
+                        <div class="form-text">{{ field.help_text }}</div>
+                    {% endif %}
 
                     {% for error in field.errors %}
 
@@ -62,11 +67,29 @@
             type="submit"
             class="create-user-btn btn btn-primary mt-4"
         >
-            Create User
+            {{ button|default:'Create User' }}
         </button>
+        <a href="{% url 'user_list' %}" class="btn btn-light mt-4 ms-2">Cancel</a>
 
     </form>
 
 </div>
 
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    // Show the scope field that belongs to the chosen role.
+    (function () {
+        var role = document.getElementById('id_role');
+        var dept = document.querySelector('[data-field="department"]');
+        var fac = document.querySelector('[data-field="faculty"]');
+        function sync() {
+            if (!role) return;
+            if (dept) dept.style.display = role.value === 'HOD' ? '' : 'none';
+            if (fac) fac.style.display = role.value === 'ADMIN' ? 'none' : '';
+        }
+        if (role) { role.addEventListener('change', sync); sync(); }
+    })();
+</script>
 {% endblock %}

@@ -30,6 +30,7 @@ Leave Management
     </div>
 
 
+    {% if not is_admin %}
     <a
         href="{% url 'leave_add' %}"
         class="apply-leave-btn btn btn-primary"
@@ -37,6 +38,7 @@ Leave Management
         <i class="bi bi-calendar-plus"></i>
         Apply Leave
     </a>
+    {% endif %}
 
 </div>
 
@@ -168,7 +170,7 @@ Leave Management
 
                     <td>
 
-                        {% if l.status == 'Pending' and role != 'FACULTY' %}
+                        {% if l.status == 'Pending' and is_admin or l.status == 'Pending' and is_hod and l.faculty.user_id != request.user.id %}
 
                         <div class="leave-actions d-flex gap-1">
 

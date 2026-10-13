@@ -31,6 +31,10 @@ urlpatterns = [
 
    
 
+    path('users/', views.user_list, name='user_list'),
+    path('users/<int:pk>/edit/', views.user_edit, name='user_edit'),
+    path('media/<path:path>', views.protected_media, name='protected_media'),
+
     path(
         'users/add/',
         views.user_add,
@@ -50,6 +54,8 @@ urlpatterns = [
         views.faculty_add,
         name='faculty_add'
     ),
+
+    path('faculty/me/', views.faculty_own, name='faculty_own'),
 
     path(
         'faculty/<int:pk>/',

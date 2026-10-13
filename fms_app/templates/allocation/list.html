@@ -19,9 +19,12 @@ Subject Allocation
         <p class="text-muted">Assign subjects to faculty by department, semester and academic year.</p>
     </div>
 
+    {% if is_manager %}
     <a href="{% url 'allocation_add' %}" class="btn btn-primary">
         <i class="bi bi-diagram-3"></i>
+        Allocate Subject
     </a>
+    {% endif %}
 </div>
 
 <form class="card card-body filter-box mb-3" method="get">
@@ -82,7 +85,7 @@ Subject Allocation
                 <th>Academic</th>
                 <th>Hours/Week</th>
                 <th>Status</th>
-                <th></th>
+                {% if is_manager %}<th></th>{% endif %}
             </tr>
         </thead>
 
@@ -125,6 +128,7 @@ Subject Allocation
                         </span>
                     </td>
 
+                    {% if is_manager %}
                     <td>
                         <form
                             method="post"
@@ -139,6 +143,7 @@ Subject Allocation
 
                         </form>
                     </td>
+                    {% endif %}
 
                 </tr>
 

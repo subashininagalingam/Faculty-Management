@@ -28,7 +28,7 @@
     </div>
 
     {% if request.user.is_authenticated %}
-        {% if request.user.is_superuser or request.user.userprofile.role != 'FACULTY' %}
+        {% if is_manager %}
             <a href="{% url 'qualification_add' %}" class="btn btn-primary">
                 <i class="bi bi-plus-lg"></i>
                 Add Qualification
@@ -89,7 +89,7 @@
 
                         <td class="text-end">
 
-                            {% if request.user.is_superuser or request.user.userprofile.role != 'FACULTY' %}
+                            {% if is_manager %}
 
                                 <a href="{% url 'qualification_edit' q.pk %}"
                                    class="btn btn-sm btn-light"
